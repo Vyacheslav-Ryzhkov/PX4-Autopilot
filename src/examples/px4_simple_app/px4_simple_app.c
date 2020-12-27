@@ -38,29 +38,100 @@
  * @author Example User <mail@example.com>
  */
 
-#include <px4_platform_common/px4_config.h>
-#include <px4_platform_common/tasks.h>
-#include <px4_platform_common/posix.h>
-#include <unistd.h>
-#include <stdio.h>
-#include <poll.h>
-#include <string.h>
-#include <math.h>
-
-#include <uORB/uORB.h>
-#include <uORB/topics/vehicle_acceleration.h>
-#include <uORB/topics/vehicle_attitude.h>
-
 __EXPORT int px4_simple_app_main(int argc, char *argv[]);
+
+void * produce(void *arg){
+	char counter = 0;
+
+	// 1. Создать разделяемую очередь
+	// вот ссылка https://nuttx.apache.org/docs/latest/reference/user/04_message_queue.html#c.mq_open
+	// как-то 4 аргументом надо установить максимальную длину очереди как 5
+	// в ссылке [2] сделали так:
+	struct mq_attr attr;
+
+	attr.mq_flags = 0;
+	attr.mq_maxmsg = CAPACITY;
+	// вес одного сообщения, в нашем случае одно целое число
+	attr.mq_msgsize = sizeof(char);
+	attr.mq_curmsgs = 0;
+
+	mqd_t Queue = mq_open(QUEUE_NAME, O_WRONLY | O_CREAT, QUEUE_PERMISSIONS, &attr );
+        PX4_INFO("Accelerometer:\t%8.4f\t%8.4f\t%8.4f",
+                    (double)raw.accelerometer_m_s2[0],
+                    (double)raw.accelerometer_m_s2[1],
+                    (double)raw.accelerometer_m_s2[2]);
+
+	while (raw.accelerometer_m_s2[0] > 5 || raw.accelerometer_m_s2[1] > 5 || raw.accelerometer_m_s2[2] > 5))
+	{
+		sleep(1); // заснуть на секунду
+		// https://nuttx.apache.org/docs/latest/reference/user/04_message_queue.html#c.mq_send
+		mq_send(Queue, &counter, sizeof(char), 2);
+		PX4_INFO("Появился крен", counter);
+
+	}
+
+	is_done = 1;
+
+	// закрыть очередь
+	// https://nuttx.apache.org/docs/latest/reference/user/04_message_queue.html#c.mq_close
+
+	mq_close(Queue);
+
+	return NULL;
+
+
+}
+
+void * consume(void *arg){
+
+	char digit;
+	unsigned int prior;
+
+	struct mq_attr attr;
+
+	attr.mq_flags = 0;
+	attr.mq_maxmsg = CAPACITY;
+	// вес одного сообщения, в нашем случае одно целое число
+	attr.mq_msgsize = sizeof(char);
+	attr.mq_curmsgs = 0;
+
+	mqd_t Queue = mq_open(QUEUE_NAME, O_RDONLY | O_CREAT , QUEUE_PERMISSIONS, &attr );
+
+	//mqd_t Queue = mq_open(QUEUE_NAME, O_RDONLY);
+
+	while(!is_done ){
+		mq_receive(Queue, &digit, sizeof(char), &prior);
+		PX4_INFO("Receiving %d with priority %d\n", digit, prior);
+		sleep(1);
+	}
+
+	// получаем все оставшиеся сообщения
+	// https://nuttx.apache.org/docs/latest/reference/user/structures.html#c.timespec
+	struct timespec time_to_wait;
+	time_to_wait.tv_sec = 1;
+	time_to_wait.tv_nsec = 0;
+
+	// здесь используем функцию получения сообщения с ожиданием 2 секунды, чтобы выйти в случае пустой очереди
+	while(mq_timedreceive(Queue, &digit, sizeof(char), &prior, &time_to_wait) != EAGAIN){
+		PX4_INFO("Receiving %d with priority %d\n", digit, prior);
+		sleep(1);
+	}
+
+
+	// закрыть очередь
+	// https://nuttx.apache.org/docs/latest/reference/user/04_message_queue.html#c.mq_close
+	mq_close(Queue);
+
+	return NULL;
+
+}
 
 int px4_simple_app_main(int argc, char *argv[])
 {
-	PX4_INFO("Hello Sky!");
 
-	/* subscribe to vehicle_acceleration topic */
 	int sensor_sub_fd = orb_subscribe(ORB_ID(vehicle_acceleration));
 	/* limit the update rate to 5 Hz */
-	orb_set_interval(sensor_sub_fd, 200);
+	orb_set_interval(sensor_sub_fd, 100);
 
 	/* advertise attitude topic */
 	struct vehicle_attitude_s att;
@@ -75,55 +146,25 @@ int px4_simple_app_main(int argc, char *argv[])
 		 */
 	};
 
-	int error_counter = 0;
+	pthread_t consumer_thread;
+	pthread_t producer_thread;
 
-	for (int i = 0; i < 5; i++) {
-		/* wait for sensor update of 1 file descriptor for 1000 ms (1 second) */
-		int poll_ret = px4_poll(fds, 1, 1000);
+	// создать и запустить поток  производителя
+	pthread_create(&producer_thread, NULL, produce, NULL);
+	// создать и запустить поток потребителя
+	pthread_create(&consumer_thread, NULL, consume, NULL);
 
-		/* handle the poll result */
-		if (poll_ret == 0) {
-			/* this means none of our providers is giving us data */
-			PX4_ERR("Got no data within a second");
+	// ждать завершения
+	pthread_join(producer_thread, NULL);
+	pthread_join(consumer_thread, NULL);
 
-		} else if (poll_ret < 0) {
-			/* this is seriously bad - should be an emergency */
-			if (error_counter < 10 || error_counter % 50 == 0) {
-				/* use a counter to prevent flooding (and slowing us down) */
-				PX4_ERR("ERROR return value from poll(): %d", poll_ret);
-			}
 
-			error_counter++;
 
-		} else {
 
-			if (fds[0].revents & POLLIN) {
-				/* obtained data for the first file descriptor */
-				struct vehicle_acceleration_s accel;
-				/* copy sensors raw data into local buffer */
-				orb_copy(ORB_ID(vehicle_acceleration), sensor_sub_fd, &accel);
-				PX4_INFO("Accelerometer:\t%8.4f\t%8.4f\t%8.4f",
-					 (double)accel.xyz[0],
-					 (double)accel.xyz[1],
-					 (double)accel.xyz[2]);
 
-				/* set att and publish this information for other apps
-				 the following does not have any meaning, it's just an example
-				*/
-				att.q[0] = accel.xyz[0];
-				att.q[1] = accel.xyz[1];
-				att.q[2] = accel.xyz[2];
 
-				orb_publish(ORB_ID(vehicle_attitude), att_pub, &att);
-			}
-
-			/* there could be more file descriptors here, in the form like:
-			 * if (fds[1..n].revents & POLLIN) {}
-			 */
-		}
-	}
-
-	PX4_INFO("exiting");
+	PX4_INFO("exiting app");
 
 	return 0;
 }
+
